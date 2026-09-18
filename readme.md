@@ -4,7 +4,15 @@ This project provides a complete vehicle and license plate recognition pipeline 
 
 The pipeline uses multiple trained models to process an uploaded image and produce vehicle, plate, and recognition results.
 
+## 🌐 Live Demo
+
+Try the deployed application here:
+
+👉 [Open Plate Recognition App](https://platerecognition-raxaevna4vhej8d4l3nqxs.streamlit.app/)
+
 ---
+
+## 📌 Main Features
 
 ## 📌 Main Features
 
