@@ -16,5 +16,4 @@ __pycache__/
 *.log
 *.tmp
 
-# Windows
-Thumbs.db
+pc_classifier_best.pt

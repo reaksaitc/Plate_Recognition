@@ -1,9 +1,9 @@
 """
 pipeline_without_dir.py
 
-Same pipeline as run_full_pipeline.py -- identical logic, identical
-preprocessing, identical model architectures -- but with NO
-dependency on the Plate_Recognition_Project folder structure. Every
+Flat deployment pipeline with no dependency on the
+Plate_Recognition_Project folder structure. This version uses the improved
+PC-v2.1 ResNet-18 classifier and its exact evaluation preprocessing. Every
 model file is expected to sit in the SAME folder as this script
 itself, using simple renamed filenames instead of the nested
 models/<stage>/<run_name>/weights/best.pt layout. Built specifically
@@ -32,7 +32,8 @@ Full end-to-end inference: raw image -> {VC, PC, PN}.
         |                             |   using the SAME box from
         v                             |   YOLO#3 above)
     "2C-5289"                         v
-                                  PC classifier (CNN)
+                                  PC classifier
+                                  ResNet-18 PC-v2.1
                                        |
                                        v
                                   "PC_PhnomPenh" or "Unknown"
@@ -48,7 +49,7 @@ Reads (all expected in the SAME folder as this script):
     plate.pt
     pn_bbx.pt
     pn_crnn_best.pt + pn_ocr.json
-    pc_classifier_best.pt + pc_class_list.json
+    pc_resnet18_v21_best.pt
 
 Usage:
     Option A (edit this file): set IMAGE_PATH below, then just run:
@@ -65,6 +66,9 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
+from torchvision import transforms
+from torchvision.models import resnet18
 from ultralytics import YOLO
 
 # EDIT THIS to test a specific image directly, without needing to type
@@ -83,23 +87,25 @@ PLATE_WEIGHTS = MODELS_DIR / "plate.pt"
 PN_LOCATOR_WEIGHTS = MODELS_DIR / "pn_bbx.pt"
 PN_OCR_WEIGHTS = MODELS_DIR / "pn_crnn_best.pt"
 PN_OCR_CHARSET = MODELS_DIR / "pn_ocr.json"
-PC_WEIGHTS = MODELS_DIR / "pc_classifier_best.pt"
-PC_CLASS_LIST = MODELS_DIR / "pc_class_list.json"
+# Improved PC-v2.1 checkpoint. The checkpoint already stores its
+# class names, input size, and ImageNet normalization parameters.
+PC_WEIGHTS = MODELS_DIR / "pc_resnet18_v21_best.pt"
 
 # --- Handoff constants -- see README_pipeline_integration.md for why ---
 VC_CROP_PADDING_FRAC = 0.10      # step 1: fixed 10% padding at inference
                                    # (train used random 0-25%, val/test 5%;
                                    # 10% is a reasonable middle ground within
                                    # that trained-for tolerance range)
-PLATE_CANONICAL_SIZE = (400, 149) # step 2: EXACT size PN locator, PN OCR,
-                                   # and PC classifier were all trained
-                                   # against -- do not change without
-                                   # retraining everything downstream
+PLATE_CANONICAL_SIZE = (400, 149) # step 2: canonical plate used by PN locator/OCR
 PN_CROP_PADDING_PX = 4            # step 3: matches evaluate_pn_ocr_crnn.py
 PN_INPUT_SIZE = (160, 32)         # (width, height) -- CRNN input
-PC_INPUT_SIZE = (400, 149)        # (width, height) -- same as canonical plate
-PC_CONFIDENCE_THRESHOLD = 0.5     # step 5: below this, report "Unknown"
-                                   # rather than a forced, possibly-wrong guess
+
+# PC-v2.1 was trained from the 400x149 masked canonical plate, then resized
+# by torchvision to 416x160 and ImageNet-normalized. The exact values are
+# read from the checkpoint at runtime.
+PC_CONFIDENCE_THRESHOLD = 0.0     # 0.0 = disabled, matching model evaluation.
+                                   # Calibrate on held-out real data before
+                                   # enabling an "Unknown" threshold.
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -168,51 +174,127 @@ def preprocess_pn_crop(crop):
 
 
 # =========================================================
-# PC classifier: architecture matches train_pc_classifier.py exactly.
+# PC classifier: improved PC-v2.1 ImageNet-pretrained ResNet-18.
+#
+# The saved checkpoint contains:
+#   - model_state_dict
+#   - class_names / class_to_idx
+#   - input_height / input_width
+#   - imagenet_mean / imagenet_std
+#
+# At inference we create the same ResNet-18 architecture with weights=None,
+# load the trained state_dict, and reproduce the REAL validation/test
+# preprocessing exactly.
 # =========================================================
 
-class PCClassifier(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        features = self.cnn(x)
-        features = features.flatten(1)
-        features = self.dropout(features)
-        return self.fc(features)
+def build_pc_model(checkpoint):
+    class_names = checkpoint["class_names"]
+    model = resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, len(class_names))
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, class_names
 
 
-def preprocess_pc_plate(plate_image):
-    """Matches train_pc_classifier.py's PCDataset normalization exactly."""
-    image = cv2.resize(plate_image, PC_INPUT_SIZE)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    image = (image - 0.5) / 0.5
-    return torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+def build_pc_transform(checkpoint):
+    input_height = int(checkpoint.get("input_height", 160))
+    input_width = int(checkpoint.get("input_width", 416))
+    mean = checkpoint.get("imagenet_mean", [0.485, 0.456, 0.406])
+    std = checkpoint.get("imagenet_std", [0.229, 0.224, 0.225])
+
+    transform = transforms.Compose([
+        transforms.Resize((input_height, input_width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    return transform, (input_width, input_height)
+
+
+def preprocess_pc_plate(plate_image, pc_transform):
+    """Match PC-v2.1 REAL validation/test preprocessing exactly."""
+    rgb = cv2.cvtColor(plate_image, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(rgb)
+    return pc_transform(pil_image).unsqueeze(0)
 
 
 # =========================================================
-# Geometry: order_points, copied verbatim from
-# prepare_pc_classification_data.py -- TL/TR/BR/BL ordering
-# regardless of the original annotation/detection order.
+# Geometry: robust TL/TR/BR/BL ordering.
+#
+# This replaces the old sum/difference heuristic, which produced bad
+# rectification for some strongly rotated or trapezoidal real plates during
+# the PC-v2 rebuild. This is the same robust ordering strategy used for the
+# corrected PC-v2 dataset extraction.
 # =========================================================
 
 def order_points(pts):
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).flatten()
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    points = np.asarray(pts, dtype=np.float32)
+
+    if points.shape != (4, 2):
+        raise ValueError(f"Expected quad shape (4, 2), got {points.shape}")
+
+    hull = cv2.convexHull(points).reshape(-1, 2)
+    if len(hull) != 4:
+        raise ValueError("Quadrilateral does not contain 4 convex corners.")
+
+    edge_lengths = []
+    for i in range(4):
+        p1 = hull[i]
+        p2 = hull[(i + 1) % 4]
+        edge_lengths.append(np.linalg.norm(p2 - p1))
+
+    pair_02 = (edge_lengths[0] + edge_lengths[2]) / 2.0
+    pair_13 = (edge_lengths[1] + edge_lengths[3]) / 2.0
+    width_edges = [0, 2] if pair_02 >= pair_13 else [1, 3]
+
+    def edge_mid_y(edge_index):
+        p1 = hull[edge_index]
+        p2 = hull[(edge_index + 1) % 4]
+        return (p1[1] + p2[1]) / 2.0
+
+    top_edge_index = min(width_edges, key=edge_mid_y)
+    top_a = hull[top_edge_index]
+    top_b = hull[(top_edge_index + 1) % 4]
+
+    if top_a[0] <= top_b[0]:
+        top_left, top_right = top_a, top_b
+    else:
+        top_left, top_right = top_b, top_a
+
+    remaining = np.asarray(
+        [
+            point
+            for point in hull
+            if not (
+                np.allclose(point, top_left)
+                or np.allclose(point, top_right)
+            )
+        ],
+        dtype=np.float32,
+    )
+
+    if len(remaining) != 2:
+        raise ValueError("Could not determine bottom corners.")
+
+    horizontal = top_right - top_left
+    horizontal_length = np.linalg.norm(horizontal)
+    if horizontal_length < 1e-6:
+        raise ValueError("Top edge has zero length.")
+    horizontal /= horizontal_length
+
+    projections = [
+        np.dot(point - top_left, horizontal)
+        for point in remaining
+    ]
+    bottom_left = remaining[np.argmin(projections)]
+    bottom_right = remaining[np.argmax(projections)]
+
+    rect = np.array(
+        [top_left, top_right, bottom_right, bottom_left],
+        dtype=np.float32,
+    )
+
+    if len(np.unique(rect, axis=0)) != 4:
+        raise ValueError("Could not uniquely order quadrilateral.")
+
     return rect
 
 
@@ -290,11 +372,25 @@ class PlateRecognitionPipeline:
         self.pn_model.load_state_dict(torch.load(PN_OCR_WEIGHTS, map_location=DEVICE))
         self.pn_model.eval()
 
-        with open(PC_CLASS_LIST, "r", encoding="utf-8") as f:
-            self.pc_class_list = json.load(f)
-        self.pc_model = PCClassifier(len(self.pc_class_list)).to(DEVICE)
-        self.pc_model.load_state_dict(torch.load(PC_WEIGHTS, map_location=DEVICE))
+        # PC-v2.1 ResNet-18 checkpoint.
+        # class_names + exact evaluation preprocessing are stored inside it,
+        # so a separate pc_class_list.json is no longer required.
+        self.pc_checkpoint = torch.load(
+            PC_WEIGHTS,
+            map_location=DEVICE,
+            weights_only=False,
+        )
+        self.pc_model, self.pc_class_list = build_pc_model(self.pc_checkpoint)
+        self.pc_model = self.pc_model.to(DEVICE)
         self.pc_model.eval()
+        self.pc_transform, self.pc_input_size = build_pc_transform(self.pc_checkpoint)
+
+        print(
+            f"PC model: {self.pc_checkpoint.get('model_name', 'resnet18')} "
+            f"| epoch={self.pc_checkpoint.get('epoch', '?')} "
+            f"| classes={len(self.pc_class_list)} "
+            f"| input={self.pc_input_size[0]}x{self.pc_input_size[1]}"
+        )
         print("All models loaded.")
 
     def run(self, image_or_path, return_debug=False):
@@ -357,17 +453,38 @@ class PlateRecognitionPipeline:
             pn_logits = self.pn_model(pn_tensor)
             pn_text = greedy_decode(pn_logits, self.pn_idx_to_char)[0]
 
-        # ---- Step 4: mask the SAME PN box white, then PC classifier ----
+        # ---- Step 4: mask the SAME PN BBOX white, then PC-v2.1 classifier ----
+        #
+        # pn_bbx.pt is an axis-aligned BBOX detector. PC-v2.1 synthetic
+        # training explicitly modeled this same rectangular inference mask.
+        plate_h, plate_w = corrected_plate.shape[:2]
+        mx1 = int(np.clip(np.floor(px1), 0, plate_w - 1))
+        my1 = int(np.clip(np.floor(py1), 0, plate_h - 1))
+        mx2 = int(np.clip(np.ceil(px2), 0, plate_w - 1))
+        my2 = int(np.clip(np.ceil(py2), 0, plate_h - 1))
+
         masked_plate = corrected_plate.copy()
-        cv2.rectangle(masked_plate, (int(px1), int(py1)), (int(px2), int(py2)),
-                      (255, 255, 255), thickness=-1)
-        pc_tensor = preprocess_pc_plate(masked_plate).to(DEVICE)
+        cv2.rectangle(
+            masked_plate,
+            (mx1, my1),
+            (mx2, my2),
+            (255, 255, 255),
+            thickness=-1,
+        )
+
+        pc_tensor = preprocess_pc_plate(
+            masked_plate,
+            self.pc_transform,
+        ).to(DEVICE)
+
         with torch.no_grad():
             pc_logits = self.pc_model(pc_tensor)
             pc_probs = torch.softmax(pc_logits, dim=1)
             top_prob, pred_idx = pc_probs.max(1)
-            top_prob = top_prob.item()
-            pc_label = self.pc_class_list[pred_idx.item()]
+            top_prob = float(top_prob.item())
+            pc_label = self.pc_class_list[int(pred_idx.item())]
+
+        debug["masked_plate"] = masked_plate
 
         # ---- Step 5: confidence-threshold Unknown fallback ----
         if top_prob < PC_CONFIDENCE_THRESHOLD:
