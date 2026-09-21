@@ -443,7 +443,7 @@ def main():
 
         st.info(
             "Upload an image or video to run "
-            "the full VC → PC → PN pipeline."
+
         )
 
         return
@@ -507,7 +507,7 @@ def main():
     # -----------------------------------------------------
 
     with st.spinner(
-        "Running VC → Plate → PN → PC..."
+        "Running "
     ):
 
         result = pipeline.run(
